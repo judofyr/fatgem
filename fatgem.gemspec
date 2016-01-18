@@ -9,6 +9,7 @@ Gem::Specification.new do |s|
   s.license     = "MIT"
   
   s.files       = ["bin/fatgem"]
+  s.executables = ["fatgem"]
   
   s.required_ruby_version = ">= 1.9.3"
 end
