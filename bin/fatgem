@@ -116,6 +116,9 @@ end
     values = specs.uniq(&type)
     if values.size != 1
       errors = values.map { |s| "- #{@versions[s]} has #{type} = #{s.send(type)}" }
+      if errors.empty?
+        errors << "- There's no gem with a specific platform"
+      end
       fail Error, ["Can only fatten gems with same '#{type}'.", *errors].join("\n")
     end
   end
