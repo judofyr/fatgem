@@ -1,0 +1,168 @@
+#!/usr/bin/env ruby
+
+require 'rubygems/package'
+require 'yaml'
+require 'digest/sha1'
+require 'tmpdir'
+require 'open-uri'
+
+class FatGem
+  class Error < StandardError; end
+
+  def self.tmp
+    Dir.mktmpdir do |dir|
+      yield new(dir)
+    end
+  end
+
+  attr_reader :directory
+
+  def initialize(directory)
+    @directory = directory
+    @files = Hash.new { |h, k| h[k] = {} }
+    @versions = {}
+    @specs = []
+  end
+
+  def open_tar(io, &blk)
+    Gem::Package::TarReader.new(io) do |reader|
+      reader.each(&blk)
+    end
+  end
+
+  def open_tar_gz(io, &blk)
+    Zlib::GzipReader.wrap io do |gzio|
+      open_tar(gzio, &blk)
+    end
+  end
+
+  def add_gem(path, ruby_version)
+
+    if @versions.has_key?(ruby_version)
+      version_str = ruby_version ? "Ruby v#{ruby_version}" : "all Ruby versions"
+      fail Error, ["Found two gems with same Ruby version:",
+                   "- #{path} matches #{version_str}",
+                   "- #{@versions[ruby_version]} also matches #{version_str}"].join("\n")
+    end
+
+    @versions[ruby_version] = path
+
+    yaml_metadata = nil
+
+    open_tar(open(path)) do |entry|
+      case entry.full_name
+      when "metadata.gz"
+        yaml_metadata = Gem.gunzip(entry.read)
+      when "metadata"
+        yaml_metadata = entry.read
+      when "data.tar.gz"
+        open_tar_gz(entry) do |data|
+          write_version(ruby_version, data.full_name, data.read)
+        end
+      end
+    end
+
+    fail Error, "#{path} does not contain a gemspec" if yaml_metadata.nil?
+
+    write_version(ruby_version, "metadata.yml", yaml_metadata)
+
+    spec = YAML.load(yaml_metadata)
+    @versions[spec] = path
+    @specs << spec
+  end
+
+  def write_version(version, path, content)
+    hash = Digest::SHA1.hexdigest(content)
+    blobpath = "data/#{hash}"
+    write(blobpath, content)
+    @files[version][path] = blobpath
+  end
+
+  def write(name, data)
+    path = File.join(@directory, name)
+    FileUtils.mkdir_p(File.dirname(path))
+    File.write(path, data)
+  end
+
+  RAKEFILE = <<-'EOF'
+require 'yaml'
+require 'rubygems/ext'
+
+task :default do
+  versions = YAML.load_file("data/index")
+  ruby_main = RUBY_VERSION.split(".")[0,2].join(".")
+  files = versions[ruby_main] || versions[nil]
+
+  if files.nil?
+    $stderr.puts "ERROR: This gem can not be installed on #{RUBY_VERSION}"
+    exit 1
+  end
+
+  files.each do |name, hash|
+    dir = File.dirname(name)
+    FileUtils.mkdir_p(dir)
+    FileUtils.cp(hash, name)
+  end
+
+  FileUtils.rm_rf("data")
+
+  version_spec = YAML.load(File.read("metadata.yml"))
+  builder = Gem::Ext::Builder.new(version_spec)
+  builder.build_extensions
+end
+  EOF
+
+  def assert_unique(type, specs = @specs)
+    values = specs.uniq(&type)
+    if values.size != 1
+      errors = values.map { |s| "- #{@versions[s]} has #{type} = #{s.send(type)}" }
+      fail Error, ["Can only fatten gems with same '#{type}'.", *errors].join("\n")
+    end
+  end
+
+  def finalize
+    platform_specs = @specs.select { |s| s.platform != "ruby" }
+
+    assert_unique :name
+    assert_unique :version
+    assert_unique :platform, platform_specs
+
+    main_spec = platform_specs[0]
+
+    write("data/index", @files.to_yaml)
+    write("Rakefile", RAKEFILE)
+
+    result = nil
+
+    Dir.chdir(@directory) do
+      main_spec.files = Dir["**/*"]
+      main_spec.extensions = ["Rakefile"]
+
+      file_name = Gem::Package.build(main_spec)
+      result = File.expand_path(file_name)
+    end
+
+    result
+  end
+end
+
+if ARGV.empty?
+  puts "usage: fatgem GEM1 GEM2 ..."
+  exit
+end
+
+begin
+  FatGem.tmp do |fat|
+    ARGV.each do |path|
+      version = path[/ruby(\d.\d)/, 1]
+      fat.add_gem(path, version)
+    end
+
+    path = fat.finalize
+    FileUtils.cp(path, File.basename(path))
+  end
+rescue FatGem::Error => e
+  puts "ERROR: #{e.message}"
+  exit 1
+end
+
